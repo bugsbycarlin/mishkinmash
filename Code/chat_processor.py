@@ -1,3 +1,12 @@
+#
+# Copyright 2015, Matthew Carlin
+#
+# Released under MIT license. Do what you want with this code; I would appreciate if you credit me!
+#
+# This program reads a set of chat files (created with https://github.com/coandco/gtalk_export)
+# and uses them to create a search database of chat exchanges. It is intended that this database
+# be used by the accompanying chat_program.py to make a chatbot.
+#
 
 import datetime
 import fnmatch
@@ -7,18 +16,31 @@ import os
 import re
 import sqlite3
 
+# Prerequisites:
+
+# 1. A ../ChatHistory directory with chat files created by gtalk_export.
+# The files should have the form username_number.txt or just username.txt.
+
+# A ../Database/search_database sqlite db file with the following tables:
 # CREATE TABLE exchanges(id integer primary key, username varchar, 
 #     datetime varchar, person varchar, call varchar, response varchar);
 # CREATE TABLE term_scores(id integer primary key, term varchar,
 #     scorelist varchar);
 # CREATE INDEX term_scores_by_term on term_scores(term);
 
-# Score is term_count * n * idf_value / text_length, where n is 1 for unigrams, 2 for bigrams.
+# The score of an exchange for a given term is term_count * n * idf_value / sqrt(text_length)
+# n is 1 for unigrams, 2 for bigrams.
+# text_length is the length in words of a block of text
+# idf_value is the term's inverse document frequency, or, one over the proportion of documents it appears in
 
 # Doesn't handle multiple line chats, of which there are about 13,000.
 chat_regex = re.compile("([\d]{4}-[\d]{2}-[\d]{2}) ([\d]{2}:[\d]{2}:[\d]{2}) <([^>]*)> ([^\n]*)")
 word_regex = re.compile("[\w']+|[?]")
 
+
+#
+# Load the conversations from the ChatHistory folder
+#
 def get_conversations():
 
   chat_files_directory = os.listdir("../ChatHistory")
@@ -44,6 +66,7 @@ def get_conversations():
           person = match.groups()[2]
           text = match.groups()[3]
 
+          # a conversation key is user plus datestamp, eg "Keith 2012-02-29"
           conversation_key = "%s %s" % (username, datestamp)
 
           if conversation_key not in conversations:
@@ -53,55 +76,71 @@ def get_conversations():
 
   return conversations
 
+
+#
+# Chunk the conversations up into exchanges. An exchange is a set of
+# lines by participant A followed by a set of lines by participant B.
+#
+# So the following conversation gets chunked up into three exchanges:
+#
+# A: blah
+# A: blah blah
+# B: bler
+# B: bler bler
+# A: yar yar yar
+# A: :-)
+# A: hoooey
+# B: blah
+# B: blue blee blah
+#
 def get_exchanges(conversations):
-  all_exchanges = []
+  exchanges = []
   for conversation_key in conversations.keys():
     conversation = conversations[conversation_key]
 
     username, datestamp = conversation_key.split(" ")
 
-    exchanges = []
+    # a block is many lines in a row by one person
+    single_user_blocks = []
     current_person = None
 
+    # keep adding lines to the last block until a new person speaks,
+    # then make a new block.
     for i, line in enumerate(conversation):
       person = line[1]
       if person != current_person:
         current_person = person
-        exchanges.append([])
-      exchanges[-1].append(line)
+        single_user_blocks.append([])
+      single_user_blocks[-1].append(line)
 
-    new_exchanges = []
-    for i in range(0, len(exchanges) - 1):
-      person = exchanges[i][0][1]
+    # each exchange is a sequence of two blocks (yours then mine)
+    # plus some metadata
+    for i in range(0, len(single_user_blocks) - 1):
+      person = single_user_blocks[i][0][1]
 
+      # this program is hard coded to look for MEEEEEE
       if person == "bugsby.carlin@gmail.com" or person == "Matthew Carlin":
         person = "Matthew"
       else:
         person = username
 
-      new_exchanges.append(
+      exchanges.append(
         {
           "username": username,
-          "datetime": datestamp + " " + exchanges[i][0][0],  #for debugging purposes later
+          "datetime": datestamp + " " + single_user_blocks[i][0][0],  #for debugging purposes later
           "person": person,
-          "call": "\n".join([x[2] for x in exchanges[i]]),
-          "response": "\n".join([x[2] for x in exchanges[i+1]]),
+          "call": "\n".join([x[2] for x in single_user_blocks[i]]),
+          "response": "\n".join([x[2] for x in single_user_blocks[i+1]]),
         }
       )
-    exchanges = new_exchanges
 
-    all_exchanges += exchanges
+  return exchanges
 
-  return all_exchanges
 
-def ngram(wordlist, start, n, storage):
-  gram = " ".join([wordlist[i].lower() for i in range(start, start + n)])
-  if gram not in storage:
-    storage[gram] = 1
-  else:
-    storage[gram] += 1
-
-def process_and_store(exchanges, c):
+#
+# Store all the exchanges in the database.
+#
+def store_exchanges(exchanges, c, connection):
   print "Storing %d exchanges." % len(exchanges)
   for i, exchange in enumerate(exchanges):
     storeExchange(exchange, c)
@@ -112,56 +151,70 @@ def process_and_store(exchanges, c):
   connection.commit()
 
 
+#
+# Process the exchanges, build
+#
+def get_and_store_term_scores(exchanges, c, connection):
   print "First pass processing %d exchanges for term scores." % len(exchanges)
 
+  # Used to calculate IDF score.
   document_frequency = {
     1: {},
     2: {}
   }
+
+  # Store the 50 best matches for any given term (to keep the database small).
   best_matches = {
     1: {},
     2: {}
   }
+
   for i, exchange in enumerate(exchanges):
-    counts = {
+
+    ngrams = {
       1: {},
       2: {}
     }
 
+    # get all the words in the first block of the exchange
     call_words = re.findall(word_regex, exchange["call"])
+
+    # square root of the length of the first block
     sq_exchange_len = math.sqrt(float(len(call_words)))
 
+    # put ngrams into the ngrams lists
     for j in range(0, len(call_words)):
-      ngram(call_words, j, 1, counts[1])
+      ngram(call_words, j, 1, ngrams[1])
       if j < len(call_words) - 1:
-        ngram(call_words, j, 2, counts[2])
+        ngram(call_words, j, 2, ngrams[2])
 
-    for key in counts.keys():
-      gram = counts[key]
+    # for every ngram
+    for key in ngrams.keys():
+      gram = ngrams[key]
       for word in gram:
+
+        # count it up for total document frequency
         if word not in document_frequency[key]:
           document_frequency[key][word] = gram[word]
         else:
           document_frequency[key][word] += gram[word]
+
+        # keep best match by count, using a heapq data structure.
         if word not in best_matches[key]:
           best_matches[key][word] = []
         heapq.heappush(best_matches[key][word], [gram[word] / sq_exchange_len, exchange["exchange_id"]])
         if len(best_matches[key][word]) > 50:
           heapq.heappop(best_matches[key][word])
 
-
-    # here's where we process scores. we're not going to be in the business of storing anything yet.
-    
-    #store(exchange, grams, c)
-
     if i % 500 == 0:
       print "First pass processed %d exchanges for term scores." % i
 
+  # count up how many total words there are.
   total = 0
   for key in best_matches:
     total += len(best_matches[key])
-  print "Second pass processing %d term scores." % total
 
+  # finish calculating document frequency values by dividing by the total number of words. 
   for key in document_frequency:
     total_words = 0
     for word in document_frequency[key]:
@@ -170,20 +223,10 @@ def process_and_store(exchanges, c):
     for word in document_frequency[key]:
       document_frequency[key][word] /= total_words
 
-  # word_ids = {}
-  # i = 0
-  # for key in best_matches:
-  #   for word in best_matches[key].keys():
-  #     if word not in word_ids:
-  #       word_id = storeTerm(word, c)
-  #       word_ids[word] = word_id
 
-  #     i += 1
+  # second pass: calculate scores and store them.
+  print "Second pass scoring and storing %d term scores." % total
 
-  #     if i % 5000 == 0:
-  #       print "Storing word %d." % i
-  # connection.commit()
-  
   i = 0
   for key in best_matches:
     for word in best_matches[key].keys():
@@ -197,36 +240,39 @@ def process_and_store(exchanges, c):
         connection.commit()
 
 
+#
+# Store an n-gram in the given storage.
+#
+def ngram(wordlist, start, n, storage):
+  gram = " ".join([wordlist[i].lower() for i in range(start, start + n)])
+  if gram not in storage:
+    storage[gram] = 1
+  else:
+    storage[gram] += 1
+
+
+#
+# Store a term score in the term_scores table.
+#
 def storeTermScore(term, scorelist, c):
   c.execute("insert or replace into term_scores (term, scorelist) values(?, ?)", (term, scorelist))
 
-# def storeTerm(term, c):
-#   c.execute("insert or replace into terms (term) values(?)", (term, ))
-#   term_id = c.lastrowid
-#   return term_id
 
+#
+# Store an exchange in the exchanges table.
+#
 def storeExchange(exchange, c):
   c.execute("insert or replace into exchanges (username, datetime, person, call, response) values(?, ?, ?, ?, ?)", \
         (exchange["username"], exchange["datetime"], exchange["person"], exchange["call"], exchange["response"]))
   exchange_id = c.lastrowid
   exchange["exchange_id"] = exchange_id
 
-def store(exchange, grams, c):
-    c.execute("insert or replace into exchanges (username, datetime, person, call, response) values(?, ?, ?, ?, ?)", \
-        (exchange["username"], exchange["datetime"], exchange["person"], exchange["call"], exchange["response"]))
-    exchange_id = c.lastrowid
 
-    term_count_data = []
-    for term in grams[1]:
-      term_count_data.append((term, grams[1][term], 1, exchange_id))
-    for term in grams[2]:
-      term_count_data.append((term, grams[2][term], 2, exchange_id))
-
-    c.executemany("insert or replace into term_counts (term, count, ngram, exchange_id) values(?, ?, ?, ?)", (term_count_data))
-
-    connection.commit()
-
-
+#
+# Legacy method to write out conversations to individual files by conversation key.
+# These are useful for debug purposes and just in general for playing with your old
+# conversations!
+#
 def write_all_the_conversations():
   print "Writing %d conversations." % len(conversations)
   for conversation_key in conversations.keys():
@@ -238,6 +284,10 @@ def write_all_the_conversations():
       for line in conversation:
         outfile.write("%s <%s> %s\n" % tuple(line))
 
+
+#
+# Main program
+#
 if __name__ == "__main__":
 
   database_path = "../Database/search_database"
@@ -248,6 +298,8 @@ if __name__ == "__main__":
   conversations = get_conversations()
   print "Getting exchanges..."
   exchanges = get_exchanges(conversations)
-  print "Processing and storing exchanges..."
-  process_and_store(exchanges, c)
+  print "Storing exchanges..."
+  store_exchanges(exchanges, c, connection)
+  print "Getting and storing term scores..."
+  get_and_store_term_scores(exchanges, c, connection)
   print "All done!"
